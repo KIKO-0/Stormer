@@ -7,6 +7,7 @@ from torch.utils.data import Dataset
 from glob import glob
 
 def get_data_given_path(path, variables):
+    # 每个 h5 文件包含一个时间步的多个变量场，这里按变量顺序拼成 [V, H, W]。
     with h5py.File(path, 'r') as f:
         data = {
             main_key: {
@@ -23,6 +24,8 @@ def get_out_path(root_dir, year, inp_file_idx, steps):
     out_file_idx = inp_file_idx + steps
     out_path = os.path.join(root_dir, f'{year}_{out_file_idx:04}.h5')
     if not os.path.exists(out_path):
+        # 处理跨年边界:
+        # 若同一年内索引不存在，先找到当前年可到达的最远步，再跳到下一年继续计数。
         for i in range(steps):
             out_file_idx = inp_file_idx + i
             out_path = os.path.join(root_dir, f'{year}_{out_file_idx:04}.h5')
@@ -48,7 +51,7 @@ class ERA5MultiStepRandomizedDataset(Dataset):
     ):
         super().__init__()
         
-        # intervals must be divisible by data_freq
+        # interval 必须是数据时间分辨率的整数倍（例如 6h 数据频率）。
         for l in list_intervals:
             assert l % data_freq == 0
 
@@ -62,7 +65,8 @@ class ERA5MultiStepRandomizedDataset(Dataset):
         
         file_paths = glob(os.path.join(root_dir, '*.h5'))
         file_paths = sorted(file_paths)
-        self.inp_file_paths = file_paths[:-(steps * max(list_intervals) // data_freq)] # the last few points do not have ground-truth
+        # 末尾样本没有足够未来真值，需裁掉。
+        self.inp_file_paths = file_paths[:-(steps * max(list_intervals) // data_freq)]
         self.file_paths = file_paths
         
     def __len__(self):
@@ -72,7 +76,7 @@ class ERA5MultiStepRandomizedDataset(Dataset):
         inp_path = self.inp_file_paths[index]
         inp_data = get_data_given_path(inp_path, self.variables)
 
-        # randomly choose an interval and get the corresponding ground-truths
+        # 每次随机选择一个基础 interval，提升模型对不同步长的鲁棒性。
         chosen_interval = np.random.choice(self.list_intervals)
         year, inp_file_idx = os.path.basename(inp_path).split('.')[0].split('_')
         year, inp_file_idx = int(year), int(inp_file_idx)
@@ -80,7 +84,8 @@ class ERA5MultiStepRandomizedDataset(Dataset):
         diffs = []
         last_out = inp_data
         
-        # get ground-truths at multiple steps
+        # 逐步构造多步监督:
+        # 使用“相邻步差分”而不是“相对初始差分”，与模型 roll-out 形式一致。
         for step in range(1, self.steps + 1):
             out_path = get_out_path(self.root_dir, year, inp_file_idx, steps=(step * chosen_interval) // self.data_freq)
             out = get_data_given_path(out_path, self.variables)
@@ -95,6 +100,7 @@ class ERA5MultiStepRandomizedDataset(Dataset):
         out_transform_mean = torch.from_numpy(self.out_transform_dict[chosen_interval].mean)
         out_transform_std = torch.from_numpy(self.out_transform_dict[chosen_interval].std)
         list_intervals = np.array([chosen_interval] * self.steps)
+        # 将小时单位缩放到十分位（与模型时间嵌入约定保持一致）。
         list_intervals = torch.from_numpy(list_intervals).to(dtype=inp_data.dtype) / 10.0
         
         return (
@@ -118,7 +124,7 @@ class ERA5MultiLeadtimeDataset(Dataset):
     ):
         super().__init__()
         
-        # lead times must be divisible by data_freq
+        # lead time 必须是数据频率的整数倍。
         for l in list_lead_times:
             assert l % data_freq == 0
 
@@ -132,7 +138,8 @@ class ERA5MultiLeadtimeDataset(Dataset):
         file_paths = sorted(file_paths)
         max_lead_time = max(*list_lead_times) if len(list_lead_times) > 1 else list_lead_times[0]
         max_steps = max_lead_time // data_freq
-        self.inp_file_paths = file_paths[:-max_steps] # the last few points do not have ground-truth
+        # 同样裁掉末尾无真值样本。
+        self.inp_file_paths = file_paths[:-max_steps]
         self.file_paths = file_paths
         
     def __len__(self):
@@ -145,7 +152,7 @@ class ERA5MultiLeadtimeDataset(Dataset):
         year, inp_file_idx = int(year), int(inp_file_idx)
         dict_out = {}
         
-        # get ground-truth paths at multiple lead times
+        # 为每个 lead time 取绝对值目标（不是差分），用于验证阶段的指标计算。
         for lead_time in self.list_lead_times:
             out_path = get_out_path(self.root_dir, year, inp_file_idx, steps=lead_time // self.data_freq)
             dict_out[lead_time] = get_data_given_path(out_path, self.variables)

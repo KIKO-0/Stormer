@@ -34,6 +34,7 @@ class GlobalForecastIterativeModule(LightningModule):
         self.net = net
         
         if pretrained_path is not None:
+            # 支持从本地或 URL 加载预训练参数（兼容旧 climate_learn checkpoint）。
             self.load_pretrained_weights(pretrained_path)
     
     def load_pretrained_weights(self, pretrained_path):
@@ -44,13 +45,15 @@ class GlobalForecastIterativeModule(LightningModule):
             """Dummy class for unknown climate_learn objects in checkpoint."""
             def __init__(self, *args, **kwargs): pass
 
-        # Patch torch's unpickler find_class to handle unknown climate_learn classes
+        # 兼容历史 checkpoint:
+        # 某些权重文件由 climate_learn 保存，反序列化时可能引用当前环境不存在的类。
+        # 这里通过自定义 Unpickler 将未知类映射为占位符，避免加载失败。
         _orig_find_class = _ts.StorageType  # just checking ts is accessible
         import pickle as _pickle
 
         _orig_load = _pickle.loads
 
-        # Use weights_only=False and override find_class via a subclass
+        # 通过子类覆写 find_class，定向处理 climate_learn 名称空间。
         import io
 
         class _PatchedUnpickler(_pickle.Unpickler):
@@ -61,7 +64,7 @@ class GlobalForecastIterativeModule(LightningModule):
                     return _Placeholder
                 return super().find_class(module, name)
 
-        # Monkey-patch pickle.Unpickler in torch.serialization module
+        # 临时替换 torch.serialization 内部使用的 Unpickler。
         _orig_Unpickler = _ts.pickle.Unpickler
         _ts.pickle.Unpickler = _PatchedUnpickler
         try:
@@ -82,8 +85,8 @@ class GlobalForecastIterativeModule(LightningModule):
         print(msg)
             
     def set_base_intervals_and_lead_times(self, list_train_intervals, val_lead_times):
-        # list_train_intervals: list of base intervals, e.g., [6, 12, 24]
-        # val_lead_times: list of target lead times, e.g., [72, 120]
+        # list_train_intervals: 训练时允许的基础时间步（小时）
+        # val_lead_times: 评估时目标预报时效（小时）
         self.val_lead_times = val_lead_times
         self.list_train_intervals = list_train_intervals
 
@@ -92,6 +95,8 @@ class GlobalForecastIterativeModule(LightningModule):
         self.lon = lon
         
     def set_transforms(self, inp_transform, diff_transform):
+        # 模型训练/推理始终在“标准化空间”进行；
+        # 但自回归滚动时需要回到原始物理量空间做增量相加，因此同时保存反变换。
         self.inp_transform = inp_transform
         self.reverse_inp_transform = self.get_reverse_transform(inp_transform)
         
@@ -101,12 +106,15 @@ class GlobalForecastIterativeModule(LightningModule):
         }
     
     def get_reverse_transform(self, transform):
+        # Normalize(x) = (x - mean) / std
+        # 逆变换可写成 Normalize(x, mean'=-mean/std, std'=1/std)
         mean, std = transform.mean, transform.std
         std_reverse = 1 / std
         mean_reverse = -mean * std_reverse
         return transforms.Normalize(mean_reverse, std_reverse)
     
     def replace_constant(self, yhat, out_variables):
+        # 对常量变量（例如地形等）强制预测增量为 0，避免无意义漂移。
         for i in range(yhat.shape[1]):
             if out_variables[i] in CONSTANTS:
                 yhat[:, i] = 0.0
@@ -114,10 +122,9 @@ class GlobalForecastIterativeModule(LightningModule):
     
     def pad(self, x: torch.Tensor):
         h = x.shape[-2]
-        # Calculate the pad size for the height if it's not divisible by the patch size
+        # 当高度不能整除 patch_size 时，仅在顶部补零，保证 patchify 维度对齐。
         if h % self.net.patch_size != 0:
             pad_size = self.net.patch_size - h % self.net.patch_size
-            # Only pad the top
             padded_x = torch.nn.functional.pad(x, (0, 0, pad_size, 0), 'constant', 0)
         else:
             padded_x = x
@@ -125,6 +132,7 @@ class GlobalForecastIterativeModule(LightningModule):
         return padded_x, pad_size
     
     def forward(self, x: torch.Tensor, variables, interval) -> torch.Tensor:
+        # net 输出包含 pad 后的高度，需裁回原始高度。
         padded_x, pad_size = self.pad(x)
         output = self.net(padded_x, variables, interval)[:, :, pad_size:]
         return output
@@ -141,7 +149,10 @@ class GlobalForecastIterativeModule(LightningModule):
         std_diff_transform = std_diff_transform.unsqueeze(-1).unsqueeze(-1) # B, V, 1, 1
         n_steps = interval_tensors.shape[-1]
 
-        # x is always in the normalized input space
+        # 训练时的多步自回归:
+        # 1) 在标准化空间预测下一步差分
+        # 2) 反标准化回原始空间并与当前状态相加
+        # 3) 再标准化后作为下一步输入
         for i in range(n_steps):
             norm_pred_diff = self(x, variables, interval_tensors[:, i]) # diff in the normalized space
             norm_pred_diff = self.replace_constant(norm_pred_diff, variables)
@@ -154,6 +165,7 @@ class GlobalForecastIterativeModule(LightningModule):
     def training_step(self, batch: Any, batch_idx: int):
         x, gt_diff, mean_diff_transform, std_diff_transform, interval_tensors, variables = batch
         pred_diff = self.forward_train(x, variables, interval_tensors, mean_diff_transform, std_diff_transform)
+        # 将时间维合并到 batch 维，便于统一计算损失。
         pred_diff = torch.stack(pred_diff, dim=1).flatten(0, 1)  # B*T, V, H, W
         gt_diff = gt_diff.flatten(0, 1)  # B*T, V, H, W
         loss_dict = lat_weighted_mse(
@@ -197,7 +209,7 @@ class GlobalForecastIterativeModule(LightningModule):
         # interval: scalar value, e.g., 6, use the same interval across the batch
         # steps: scalar value, e.g., 24, number of autoregressive steps
 
-        # x is always in the normalized input space
+        # 验证/测试 roll-out 与训练一致，只是 interval 在一个 batch 内固定。
         interval_tensor = torch.Tensor([interval]).to(device=x.device, dtype=x.dtype) / 10.0
         interval_tensor = interval_tensor.repeat(x.shape[0])
         for _ in range(steps):
@@ -239,7 +251,8 @@ class GlobalForecastIterativeModule(LightningModule):
         
         for target_lead_time in val_lead_times:
             all_norm_preds = []
-            ### roll-out using a single base interval
+            # 先用每个可整除的 base interval 独立滚动，记录各自指标；
+            # 再对多个 base interval 的预测做 ensemble mean。
             for base_interval in self.list_train_intervals:
                 if target_lead_time % base_interval == 0:
                     steps = target_lead_time // base_interval
@@ -280,6 +293,7 @@ class GlobalForecastIterativeModule(LightningModule):
         decay = []
         no_decay = []
         for name, m in self.named_parameters():
+            # 位置/通道嵌入一般不做权重衰减，减少对编码先验的破坏。
             if "channel_embed" in name or "pos_embed" in name:
                 no_decay.append(m)
             else:
@@ -302,6 +316,7 @@ class GlobalForecastIterativeModule(LightningModule):
             ]
         )
 
+        # 按“优化器 step 数”配置 warmup + cosine 调度（而非 epoch 级）。
         n_steps_per_machine = len(self.trainer.datamodule.train_dataloader())
         n_steps = int(n_steps_per_machine / (self.trainer.num_devices * self.trainer.num_nodes))
         lr_scheduler = LinearWarmupCosineAnnealingLR(

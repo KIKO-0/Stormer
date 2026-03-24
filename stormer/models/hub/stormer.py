@@ -6,6 +6,8 @@ from .weather_embedding import WeatherEmbedding
 
 
 def modulate(x, shift, scale):
+    # adaLN-Zero 的核心调制函数:
+    # 对归一化后的 token 做逐通道仿射变换（按 batch 维度广播到序列长度）。
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
 
@@ -42,6 +44,8 @@ class MemEffAttention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
 
     def forward(self, x, attn_bias=None):
+        # 输入 x: [B, N, C]
+        # 先映射为 qkv，再调用 xformers 的 memory_efficient_attention 以节省显存。
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads)
 
@@ -73,6 +77,8 @@ class Block(nn.Module):
         )
 
     def forward(self, x, c):
+        # c 为时间间隔嵌入，生成 6 组调制参数:
+        # (shift/scale/gate)_msa + (shift/scale/gate)_mlp
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
         x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
@@ -109,6 +115,8 @@ class Stormer(nn.Module):
     ):
         super().__init__()
         
+        # 高度维可能不是 patch_size 的整数倍，这里在模型内部统一向上补齐，
+        # 后续在 iterative_module 中会把顶部 pad 去掉，保持输出对齐原网格。
         if in_img_size[0] % patch_size != 0:
             pad_size = patch_size - in_img_size[0] % patch_size
             in_img_size = (in_img_size[0] + pad_size, in_img_size[1])
@@ -140,7 +148,7 @@ class Stormer(nn.Module):
         self.initialize_weights()
 
     def initialize_weights(self):
-        # Initialize transformer layers:
+        # 初始化线性层参数（trunc normal）和 bias（0）。
         def _basic_init(module):
             if isinstance(module, nn.Linear):
                 trunc_normal_(module.weight, std=0.02)
@@ -148,10 +156,10 @@ class Stormer(nn.Module):
                     nn.init.constant_(module.bias, 0)
         self.apply(_basic_init)
 
-        # Initialize timestep embedding MLP:
+        # 时间嵌入层单独初始化。
         trunc_normal_(self.t_embedder.mlp.weight, std=0.02)
         
-        # Zero-out adaLN modulation layers in blocks:
+        # adaLN-Zero 的关键: 调制层初始为 0，让网络初期更接近恒等映射，稳定训练。
         for block in self.blocks:
             nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
             nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
@@ -173,19 +181,24 @@ class Stormer(nn.Module):
         assert h * w == x.shape[1]
 
         x = x.reshape(shape=(x.shape[0], h, w, p, p, v))
+        # 将 patch 内像素维度和网格维度重排回图像布局。
         x = torch.einsum("nhwpqv->nvhpwq", x)
         imgs = x.reshape(shape=(x.shape[0], v, h * p, w * p))
         return imgs
 
     def forward(self, x, variables, time_interval):
-        
+        # 1) 多变量输入 -> patch token 序列
         x = self.embedding(x, variables) # B, L, D
         x = self.embed_norm_layer(x)
 
+        # 2) 时间间隔条件嵌入（例如 6h/12h/24h）
         time_interval_emb = self.t_embedder(time_interval)
+
+        # 3) 主干 Transformer（每层都受时间条件调制）
         for block in self.blocks:
             x = block(x, time_interval_emb)
         
+        # 4) 预测 patch 级别残差并还原到网格
         x = self.head(x, time_interval_emb)
         x = self.unpatchify(x)
         
