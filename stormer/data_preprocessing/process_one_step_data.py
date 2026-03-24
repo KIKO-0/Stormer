@@ -75,7 +75,8 @@ def create_one_step_dataset(root_dir, save_dir, split, years, list_vars, chunk_s
     list_pressure_vars = [v for v in list_vars if v in PRESSURE_LEVEL_VARS]
     
     # load a constant variable to save lat and lon arrays
-    ds_constant = xr.open_dataset(os.path.join(root_dir, f'{list_constant_vars[0]}.nc'))
+    first_constant = next(v for v in list_constant_vars if os.path.exists(os.path.join(root_dir, f'{v}.nc')))
+    ds_constant = xr.open_dataset(os.path.join(root_dir, f'{first_constant}.nc'))
     lat = ds_constant.latitude.to_numpy()
     lat.sort()
     lon = ds_constant.longitude.to_numpy()
@@ -84,7 +85,8 @@ def create_one_step_dataset(root_dir, save_dir, split, years, list_vars, chunk_s
     np.save(os.path.join(save_dir, 'lon.npy'), lon)
     
     for year in tqdm(years, desc='years', position=0):
-        ds_sample = xr.open_dataset(os.path.join(root_dir, list_single_vars[0], f'{year}.nc'))
+        sample_var = next(v for v in list_single_vars if os.path.exists(os.path.join(root_dir, v, f'{year}.nc')))
+        ds_sample = xr.open_dataset(os.path.join(root_dir, sample_var, f'{year}.nc'))
         if chunk_size is not None:
             n_chunks = len(ds_sample.time) // chunk_size + 1
         else:
@@ -95,13 +97,17 @@ def create_one_step_dataset(root_dir, save_dir, split, years, list_vars, chunk_s
         
         ds_dict = {}
         for var in (list_single_vars + list_pressure_vars):
-            ds_dict[var] = xr.open_dataset(os.path.join(root_dir, var, f'{year}.nc'))
+            var_path = os.path.join(root_dir, var, f'{year}.nc')
+            if os.path.exists(var_path):
+                ds_dict[var] = xr.open_dataset(var_path)
+            else:
+                pass # print(f"Skipping missing variable: {var}")
 
         for chunk_id in tqdm(range(n_chunks), desc='chunks', position=1, leave=False):
             dict_np = {}
             list_time_stamps = None
             ### convert ds to numpy
-            for var in (list_single_vars + list_pressure_vars):
+            for var in ds_dict.keys():
                 ds = ds_dict[var].isel(time=slice(chunk_id*chunk_size, (chunk_id+1)*chunk_size))
                 if list_time_stamps is None:
                     list_time_stamps = ds.time.values
@@ -122,6 +128,7 @@ def create_one_step_dataset(root_dir, save_dir, split, years, list_vars, chunk_s
                     data_dict['input'][var] = dict_np[var][i]
                 for var in list_constant_vars:
                     constant_path = os.path.join(root_dir, f'{var}.nc')
+                    if not os.path.exists(constant_path): continue
                     constant_field = xr.open_dataset(constant_path)[var].to_numpy()
                     constant_field = constant_field.reshape(constant_field.shape[-2:])
                     data_dict['input'][var] = constant_field

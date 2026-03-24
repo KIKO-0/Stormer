@@ -37,13 +37,48 @@ class GlobalForecastIterativeModule(LightningModule):
             self.load_pretrained_weights(pretrained_path)
     
     def load_pretrained_weights(self, pretrained_path):
-        if pretrained_path.startswith("http"):
-            checkpoint = torch.hub.load_state_dict_from_url(pretrained_path)
-        else:
-            checkpoint = torch.load(pretrained_path, map_location=torch.device("cpu"))
+        from stormer.utils.lr_scheduler import LinearWarmupCosineAnnealingLR
+        import torch.serialization as _ts
+
+        class _Placeholder:
+            """Dummy class for unknown climate_learn objects in checkpoint."""
+            def __init__(self, *args, **kwargs): pass
+
+        # Patch torch's unpickler find_class to handle unknown climate_learn classes
+        _orig_find_class = _ts.StorageType  # just checking ts is accessible
+        import pickle as _pickle
+
+        _orig_load = _pickle.loads
+
+        # Use weights_only=False and override find_class via a subclass
+        import io
+
+        class _PatchedUnpickler(_pickle.Unpickler):
+            def find_class(self, module, name):
+                if module.startswith('climate_learn'):
+                    if name == 'LinearWarmupCosineAnnealingLR':
+                        return LinearWarmupCosineAnnealingLR
+                    return _Placeholder
+                return super().find_class(module, name)
+
+        # Monkey-patch pickle.Unpickler in torch.serialization module
+        _orig_Unpickler = _ts.pickle.Unpickler
+        _ts.pickle.Unpickler = _PatchedUnpickler
+        try:
+            if pretrained_path.startswith("http"):
+                checkpoint = torch.hub.load_state_dict_from_url(
+                    pretrained_path, map_location=torch.device("cpu"), weights_only=False
+                )
+            else:
+                checkpoint = torch.load(
+                    pretrained_path, map_location=torch.device("cpu"), weights_only=False
+                )
+        finally:
+            _ts.pickle.Unpickler = _orig_Unpickler
+
         print("Loading pre-trained checkpoint from: %s" % pretrained_path)
         state_dict = checkpoint["state_dict"]
-        msg = self.load_state_dict(state_dict)
+        msg = self.load_state_dict(state_dict, strict=False)
         print(msg)
             
     def set_base_intervals_and_lead_times(self, list_train_intervals, val_lead_times):

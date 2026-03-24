@@ -80,31 +80,32 @@ variables = [
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # load pretrained model
+pretrained_path = 'https://huggingface.co/tungnd/stormer/resolve/main/stormer_1.40625_patch_size_4.ckpt'
 net = Stormer(
     in_img_size=[128, 256],
     variables=variables,
-    patch_size=2,
+    patch_size=4,
     hidden_size=1024,
     depth=24,
     num_heads=16,
     mlp_ratio=4,
 )
-pretrained_path = 'https://huggingface.co/tungnd/stormer/resolve/main/stormer_1.40625_patch_size_2.ckpt'
 model = GlobalForecastIterativeModule(net, pretrained_path=pretrained_path).to(device)
 model.eval()
 
 # load data
-root_dir = '/eagle/MDClimSim/tungnd/data/wb2/1.40625deg_from_full_res_1_step_6hr_h5df'
-normalize_mean = dict(np.load(os.path.join(root_dir, "normalize_mean.npz")))
+root_dir = 'mini_wb2_h5df_regridded'
+norm_dir = 'normalization_constants'
+normalize_mean = dict(np.load(os.path.join(norm_dir, "normalize_mean.npz")))
 normalize_mean = np.concatenate([normalize_mean[v] for v in variables], axis=0)
-normalize_std = dict(np.load(os.path.join(root_dir, "normalize_std.npz")))
+normalize_std = dict(np.load(os.path.join(norm_dir, "normalize_std.npz")))
 normalize_std = np.concatenate([normalize_std[v] for v in variables], axis=0)
 inp_transform = transforms.Normalize(normalize_mean, normalize_std)
 dataset = ERA5MultiLeadtimeDataset(
     root_dir=os.path.join(root_dir, 'test'),
     variables=variables,
     transform=inp_transform,
-    list_lead_times=[24, 72, 120, 168],  # 1, 3, 5, 7 days
+    list_lead_times=[6],  # only 6h ahead (mini dataset)
     data_freq=6,
 )
 inp_data, out_data_dict, _ = dataset[0]
@@ -113,7 +114,7 @@ out_data_dict = {k: v.unsqueeze(0).to(device) for k, v in out_data_dict.items()}
 
 out_transforms = {}
 for l in [6, 12, 24]:
-    normalize_diff_std = dict(np.load(os.path.join(root_dir, f"normalize_diff_std_{l}.npz")))
+    normalize_diff_std = dict(np.load(os.path.join(norm_dir, f"normalize_diff_std_{l}.npz")))
     normalize_diff_std = np.concatenate([normalize_diff_std[v] for v in variables], axis=0)
     out_transforms[l] = transforms.Normalize(np.zeros_like(normalize_diff_std), normalize_diff_std)
 model.set_transforms(inp_transform, out_transforms)
