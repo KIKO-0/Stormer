@@ -138,4 +138,7 @@ exps
 .snakemake
 
 submit.sh.e*
-submit.sh.o*
+submit.sh.o* *.ckpt
+  *.h5
+  *.nc
+  *.npz
