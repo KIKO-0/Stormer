@@ -1,0 +1,10 @@
+Stormer (patch_size=4) Evaluation Results
+Data: mini_wb2_h5df_regridded/test
+======================================================================
+Variable                              Leadh         RMSE        ACC
+======================================================================
+geopotential_500                         6h      20.8281     1.0000
+temperature_850                          6h       0.3499     0.9994
+2m_temperature                           6h       0.3515     0.9997
+10m_u_component_of_wind                  6h       0.4463     0.9964
+mean_sea_level_pressure                  6h      30.4672     0.9997
